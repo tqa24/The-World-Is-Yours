@@ -5,34 +5,61 @@
 # ships an empty /nginx skeleton (so dpkg keeps the dirs across upgrades) plus
 # a pristine copy of every config under /usr/share/twiy/defaults/nginx.
 #
-# Config policy for twiy:
-#   - target present (identical OR admin-edited) -> NEVER replace; leave as-is.
-#   - target absent                             -> ASK the admin (per file,
-#                                                  Y/N) and only create it on Y.
-# We never drop <file>.new and we never overwrite an existing config, so an
-# upgrade can never change an admin-edited config.
+# This script NEVER prompts. The packaged defaults fall into two classes:
+#
+#   STOCK — nginx's own plumbing files (fastcgi.conf, fastcgi_params,
+#           mime.types, scgi_params, uwsgi_params, koi-utf, koi-win, win-utf).
+#           Nobody hand-tunes these, and a missing one breaks every vhost that
+#           includes it, so they are placed when absent and refreshed when they
+#           differ from the packaged copy — fresh install and upgrade alike.
+#
+#   ADMIN — everything else (nginx.conf, live/, conf.d/, config/, modsec/).
+#           Fresh install -> placed if absent, no questions: /nginx is empty by
+#           design at that point and nginx will not start without them.
+#           Upgrade      -> NEVER touched. Unmodified, admin-edited or deleted,
+#           it is left exactly as found: no replace, no restore, no prompt.
+#
+# TWIY_SEED_DEFAULTS overrides the ADMIN behaviour, for automation:
+#   yes -> also place any missing ADMIN default on an upgrade (never overwrites)
+#   no  -> hands off entirely; not even STOCK files are touched
 #
 # /hostdata is left entirely to the admin: we only make sure the dir exists,
 # and we never touch or remove its contents.
 
 set -e
 
-# Ask the admin a yes/no question on the controlling terminal. Defaults to
-# "no" (return 1) whenever we cannot prompt — noninteractive frontend or no
-# usable terminal — so a config is never created without explicit consent.
-prompt_yes_no() {
-    msg="$1"
-    if [ "${DEBIAN_FRONTEND:-}" = noninteractive ] || [ ! -r /dev/tty ]; then
-        echo "twiy: $msg -> skipped (noninteractive)"
-        return 1
-    fi
-    printf 'twiy: %s [y/N] ' "$msg" > /dev/tty
-    read ans < /dev/tty || ans=""
-    case "$ans" in
-        [Yy]|[Yy][Ee][Ss]) return 0 ;;
-        *) return 1 ;;
+# STOCK defaults, matched on the path RELATIVE to /nginx — so a same-named file
+# under live/ or conf.d/ is admin config, not stock.
+is_stock() {
+    case "$1" in
+        fastcgi.conf|fastcgi_params|mime.types|scgi_params|uwsgi_params|koi-utf|koi-win|win-utf)
+            return 0 ;;
+        *)  return 1 ;;
     esac
 }
+
+# Byte-identical? Uses md5sum (coreutils, Essential) rather than cmp, which
+# lives in diffutils and is not guaranteed present for a maintainer script.
+same_content() {
+    [ -e "$2" ] || return 1
+    [ "$(md5sum < "$1")" = "$(md5sum < "$2")" ]
+}
+
+# dpkg calls us as `postinst configure <old-version>`; $2 is empty only on a
+# fresh install (or on reinstall after a purge), which is exactly the case where
+# an empty /nginx is expected rather than admin intent.
+if [ "$1" = configure ] && [ -z "${2:-}" ]; then
+    fresh_install=yes
+else
+    fresh_install=no
+fi
+
+seed_admin=$fresh_install
+hands_off=no
+case "${TWIY_SEED_DEFAULTS:-}" in
+    [Yy]|[Yy][Ee][Ss]) seed_admin=yes ;;
+    [Nn]|[Nn][Oo])     seed_admin=no; hands_off=yes ;;
+esac
 
 useradd -r -s /bin/false nginx 2>/dev/null || true
 
@@ -43,15 +70,13 @@ mkdir -p /nginx /hostdata
 # upgrade unpack deletes them before this script runs. preinst stashed a copy
 # first — restore the admin's own files now, without clobbering anything
 # already present (cp -n). This only puts back what dpkg removed; it never
-# introduces new packaged defaults, so no prompt is needed here.
+# introduces new packaged defaults.
 if [ -d /var/backups/twiy-nginx ]; then
     cp -an /var/backups/twiy-nginx/. /nginx/ 2>/dev/null || true
     rm -rf /var/backups/twiy-nginx
 fi
 
-# Seed packaged defaults:
-#   - target present  -> do nothing (never replace, no .new).
-#   - target absent   -> ask the admin; create it only if they answer yes.
+# Place the packaged defaults per the policy documented above.
 seed_tree() {
     stash="$1"
     target="$2"
@@ -59,19 +84,39 @@ seed_tree() {
     find "$stash" -type f | while IFS= read -r src; do
         rel=${src#$stash/}
         dst="$target/$rel"
+
+        if is_stock "$rel"; then
+            if same_content "$src" "$dst"; then
+                continue
+            fi
+            if [ -e "$dst" ]; then
+                what=refreshed
+            else
+                what=created
+            fi
+            install -d "$(dirname "$dst")"
+            cp -p "$src" "$dst"
+            echo "twiy: $what $dst"
+            continue
+        fi
+
+        # ADMIN config: present is never touched; absent is created only when
+        # seeding is allowed (fresh install, or TWIY_SEED_DEFAULTS=yes).
         if [ -e "$dst" ]; then
             continue
         fi
-        if prompt_yes_no "config '$dst' does not exist. Create it from the packaged default?"; then
+        if [ "$seed_admin" = yes ]; then
             install -d "$(dirname "$dst")"
             cp -p "$src" "$dst"
             echo "twiy: created $dst"
         else
-            echo "twiy: skipped $dst"
+            echo "twiy: $dst is missing, left as-is (admin owns it)"
         fi
     done
 }
-seed_tree /usr/share/twiy/defaults/nginx /nginx
+if [ "$hands_off" = no ]; then
+    seed_tree /usr/share/twiy/defaults/nginx /nginx
+fi
 
 install -d /nginx/conf.d /nginx/config
 install -d -o nginx -g nginx -m 0755 /var/log/nginx

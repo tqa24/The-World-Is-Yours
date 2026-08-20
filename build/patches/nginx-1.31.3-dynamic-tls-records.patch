@@ -28,7 +28,7 @@ diff -urN nginx-1.31.0-pristine2/src/event/ngx_event_openssl.c nginx-1.31.0-manu
 +            if (ngx_current_msec - c->ssl->dyn_rec_last_write >
 +                c->ssl->dyn_rec.timeout)
 +            {
-+                buf->end = buf->start + c->ssl->dyn_rec.size_lo;
++                buf->end = buf->start + ngx_min(c->ssl->dyn_rec.size_lo, c->ssl->buffer_size);
 +                c->ssl->dyn_rec_records_sent = 0;
 +
 +            } else {
@@ -40,10 +40,10 @@ diff -urN nginx-1.31.0-pristine2/src/event/ngx_event_openssl.c nginx-1.31.0-manu
 +                } else if (c->ssl->dyn_rec_records_sent >
 +                           c->ssl->dyn_rec.threshold)
 +                {
-+                    buf->end = buf->start + c->ssl->dyn_rec.size_hi;
++                    buf->end = buf->start + ngx_min(c->ssl->dyn_rec.size_hi, c->ssl->buffer_size);
 +
 +                } else {
-+                    buf->end = buf->start + c->ssl->dyn_rec.size_lo;
++                    buf->end = buf->start + ngx_min(c->ssl->dyn_rec.size_lo, c->ssl->buffer_size);
 +                }
 +            }
 +        }
